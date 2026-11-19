@@ -44,6 +44,7 @@
  */
 
 #include "gmxpre.h"
+#include <cstdlib>
 
 #include <array>
 #include <vector>
@@ -331,7 +332,9 @@ void ListedForcesGpu::Impl::updateHaveInteractions(const InteractionDefinitions&
          * still easily handle the types that have no perturbed
          * interactions on the GPU. */
         const int ft = static_cast<int>(fType);
-        if (!idef.il[ft].empty() && !fTypeHasPerturbedEntries(idef, ft))
+        if (!idef.il[ft].empty() && !fTypeHasPerturbedEntries(idef, ft)
+            && !(fType == InteractionFunction::DihedralEnergyCorrectionMap
+                 && std::getenv("GMX_DISABLE_GPU_CMAP") != nullptr))
         {
             haveInteractions_ = true;
             return;
@@ -372,7 +375,9 @@ void ListedForcesGpu::Impl::updateInteractionListsAndDeviceBuffers(ArrayRef<cons
          * But instead of doing all interactions on the CPU, we can
          * still easily handle the types that have no perturbed
          * interactions on the GPU. */
-        if (!idef.il[ft].empty() && !fTypeHasPerturbedEntries(idef, ft))
+        if (!idef.il[ft].empty() && !fTypeHasPerturbedEntries(idef, ft)
+            && !(fType == InteractionFunction::DihedralEnergyCorrectionMap
+                 && std::getenv("GMX_DISABLE_GPU_CMAP") != nullptr))
         {
             haveGpuInteractions = true;
 

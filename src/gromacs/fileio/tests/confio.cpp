@@ -43,6 +43,7 @@
 #include "gromacs/fileio/confio.h"
 
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -55,6 +56,7 @@
 #include "gromacs/topology/atoms.h"
 #include "gromacs/topology/symtab.h"
 #include "gromacs/topology/topology.h"
+#include "gromacs/trajectory/trajectoryframe.h"
 #include "gromacs/utility/basedefinitions.h"
 #include "gromacs/utility/cstringutil.h"
 #include "gromacs/utility/smalloc.h"
@@ -63,6 +65,7 @@
 
 #include "testutils/stringtest.h"
 #include "testutils/testfilemanager.h"
+#include "testutils/trajectoryreader.h"
 
 // TODO: These should really appear somewhere centralized.
 /*! \brief
@@ -211,6 +214,30 @@ TEST_P(StructureIORoundtripTest, ReadWriteTpsConf)
 INSTANTIATE_TEST_SUITE_P(WithDifferentFormats,
                          StructureIORoundtripTest,
                          ::testing::Values(efGRO, efG96, efPDB, efESP));
+
+TEST(GroTrajectoryIOTest, SingleFrameEndOfFileIsHandled)
+{
+    gmx::test::TestFileManager fileManager;
+    const std::filesystem::path trajectoryFilename =
+            fileManager.getTemporaryFilePath("single-frame.gro");
+    constexpr char trajectoryContents[] = "single frame t=0.0 step=0\n"
+                                          "    1\n"
+                                          "    1SOL     OW    1   0.000   0.000   0.000\n"
+                                          "   1.00000   1.00000   1.00000\n";
+    {
+        // Use binary mode so the fixture keeps Unix line endings. Source and regression-test
+        // GRO files use this form even when GROMACS is built and run natively on Windows.
+        std::ofstream trajectoryFile(trajectoryFilename, std::ios::binary);
+        ASSERT_TRUE(trajectoryFile.is_open());
+        trajectoryFile.write(trajectoryContents, sizeof(trajectoryContents) - 1);
+    }
+
+    gmx::test::TrajectoryFrameReader reader(trajectoryFilename);
+    ASSERT_TRUE(reader.readNextFrame());
+    const gmx::TrajectoryFrame frame = reader.frame();
+    EXPECT_EQ(frame.step(), 0);
+    EXPECT_FALSE(reader.readNextFrame());
+}
 
 
 TEST(StructureIOTest, ReadTpsConfRetainsChainids)

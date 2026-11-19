@@ -241,8 +241,26 @@ static DevelopmentFeatureFlags manageDevelopmentFeatures(const gmx::MDLogger& md
     DevelopmentFeatureFlags devFlags;
 
     const bool cudaGraphsExplicitlyRequested = (std::getenv("GMX_CUDA_GRAPH") != nullptr);
+    const bool cudaGraphsExplicitlyDisabled =
+            (std::getenv("GMX_DISABLE_CUDA_GRAPH") != nullptr);
 
-    if (GpuConfigurationCapabilities::GpuGraph)
+    if (cudaGraphsExplicitlyRequested && cudaGraphsExplicitlyDisabled)
+    {
+        gmx_fatal(FARGS,
+                  "GMX_CUDA_GRAPH and GMX_DISABLE_CUDA_GRAPH cannot both be set. Unset one of "
+                  "the two environment variables.");
+    }
+
+    if (cudaGraphsExplicitlyDisabled)
+    {
+        devFlags.enableCudaGraphs = false;
+        GMX_LOG(mdlog.warning)
+                .asParagraph()
+                .appendText(
+                        "GMX_DISABLE_CUDA_GRAPH environment variable is detected. GPU Graphs "
+                        "are disabled for this run.");
+    }
+    else if (GpuConfigurationCapabilities::GpuGraph)
     {
         devFlags.enableCudaGraphs = true;
         if (cudaGraphsExplicitlyRequested)

@@ -43,6 +43,7 @@
 #include "gmxpre.h"
 
 #include "gpuforcereduction_impl.h"
+#include <cstdlib>
 
 #include "gromacs/gpu_utils/device_stream.h"
 #include "gromacs/gpu_utils/devicebuffer.h"
@@ -167,7 +168,8 @@ void GpuForceReduction::Impl::execute()
         // The CUDA fused kernel does not read a destination force that another
         // thread can be writing. Fall back to the standalone spread whenever
         // force reduction accumulates into an existing buffer.
-        if (!accumulate_ && atomStart_ == 0 && opcBlockAtomStart_ >= 0
+        static const bool disableOpcFusion = std::getenv("GMX_DISABLE_OPC_FUSION") != nullptr;
+        if (!disableOpcFusion && !accumulate_ && atomStart_ == 0 && opcBlockAtomStart_ >= 0
             && opcBlockAtomStart_ + 4 * opcBlockNumSites_ <= numAtoms_)
         {
             opcVsiteFusion =

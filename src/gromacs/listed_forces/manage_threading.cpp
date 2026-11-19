@@ -40,6 +40,7 @@
  * \ingroup module_listed_forces
  */
 #include "gmxpre.h"
+#include <cstdlib>
 
 #include "manage_threading.h"
 
@@ -238,7 +239,9 @@ static void divide_bondeds_over_threads(bonded_threading_t*           bt,
              * But instead of doing all on the CPU, we could do only
              * the actually perturbed interactions on the CPU.
              */
-            if (!ftypeHasPerturbedEntries(idef, fType))
+            if (!ftypeHasPerturbedEntries(idef, fType)
+                && !(fType == InteractionFunction::DihedralEnergyCorrectionMap
+                     && std::getenv("GMX_DISABLE_GPU_CMAP") != nullptr))
             {
                 /* We will assign this interaction type to the GPU */
                 nrToAssignToCpuThreads = 0;
