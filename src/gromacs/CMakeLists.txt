@@ -469,7 +469,9 @@ target_link_libraries(libgromacs PRIVATE plumedgmx)
 
 # Make sure we fix "everything" found by compilers that support that
 gmx_warn_on_everything(libgromacs)
-if (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+option(GMX_MSVC_CODE_ANALYSIS "Run slow MSVC /analyze checks while compiling libgromacs" OFF)
+mark_as_advanced(GMX_MSVC_CODE_ANALYSIS)
+if (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC" AND GMX_MSVC_CODE_ANALYSIS)
    target_compile_options(libgromacs PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/analyze /analyze:stacksize 70000
      #Control flow warnings are disabled because the commond line output is insufficient. There is no tool
      #to convert the xml report to e.g. HTML and even in Visual Studio the viewer doesn't work with cmake support.

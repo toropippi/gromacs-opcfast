@@ -114,6 +114,7 @@
 #include "gromacs/mdlib/md_support.h"
 #include "gromacs/mdlib/mdatoms.h"
 #include "gromacs/mdlib/mdgraph_gpu.h"
+#include "gromacs/mdlib/opc_vsite_support.h"
 #include "gromacs/mdlib/sighandler.h"
 #include "gromacs/mdlib/stophandler.h"
 #include "gromacs/mdlib/tgroup.h"
@@ -239,11 +240,13 @@ static DevelopmentFeatureFlags manageDevelopmentFeatures(const gmx::MDLogger& md
 {
     DevelopmentFeatureFlags devFlags;
 
-    if (std::getenv("GMX_CUDA_GRAPH") != nullptr)
+    const bool cudaGraphsExplicitlyRequested = (std::getenv("GMX_CUDA_GRAPH") != nullptr);
+
+    if (GpuConfigurationCapabilities::GpuGraph)
     {
-        if (GpuConfigurationCapabilities::GpuGraph)
+        devFlags.enableCudaGraphs = true;
+        if (cudaGraphsExplicitlyRequested)
         {
-            devFlags.enableCudaGraphs = true;
             GMX_LOG(mdlog.warning)
                     .asParagraph()
                     .appendText(
@@ -253,34 +256,42 @@ static DevelopmentFeatureFlags manageDevelopmentFeatures(const gmx::MDLogger& md
         }
         else
         {
-            devFlags.enableCudaGraphs = false;
-            std::string errorReason;
-            if (GMX_GPU_CUDA)
+            GMX_LOG(mdlog.info)
+                    .asParagraph()
+                    .appendText(
+                            "This OPC performance build enables GPU Graphs by default when run "
+                            "conditions allow.");
+        }
+    }
+    else if (cudaGraphsExplicitlyRequested)
+    {
+        devFlags.enableCudaGraphs = false;
+        std::string errorReason;
+        if (GMX_GPU_CUDA)
+        {
+            errorReason = "the CUDA version in use is below the minimum requirement (11.1)";
+        }
+        else if (GMX_GPU_SYCL)
+        {
+            if (GMX_SYCL_DPCPP)
             {
-                errorReason = "the CUDA version in use is below the minimum requirement (11.1)";
-            }
-            else if (GMX_GPU_SYCL)
-            {
-                if (GMX_SYCL_DPCPP)
-                {
-                    errorReason = "GROMACS is built without GMX_SYCL_ENABLE_GRAPHS";
-                }
-                else
-                {
-                    errorReason = "SYCL Graph extension is only supported in oneAPI DPC++";
-                }
+                errorReason = "GROMACS is built without GMX_SYCL_ENABLE_GRAPHS";
             }
             else
             {
-                errorReason = "CUDA or SYCL build is required";
+                errorReason = "SYCL Graph extension is only supported in oneAPI DPC++";
             }
-            GMX_LOG(mdlog.warning)
-                    .asParagraph()
-                    .appendTextFormatted(
-                            "GMX_CUDA_GRAPH environment variable is detected, but %s. GPU Graphs "
-                            "will be disabled.",
-                            errorReason.c_str());
         }
+        else
+        {
+            errorReason = "CUDA or SYCL build is required";
+        }
+        GMX_LOG(mdlog.warning)
+                .asParagraph()
+                .appendTextFormatted(
+                        "GMX_CUDA_GRAPH environment variable is detected, but %s. GPU Graphs "
+                        "will be disabled.",
+                        errorReason.c_str());
     }
 
     if (std::getenv("GMX_ENABLE_NVSHMEM") != nullptr)
@@ -1633,6 +1644,29 @@ int Mdrunner::mdrunner()
             canUseDirectGpuComm,
             useGpuPmeDecomposition);
 
+    const OpcVsiteAnalysis opcVsiteAnalysis = analyzeOpcGpuVsites(mtop);
+    // Mdrunner can be invoked repeatedly in one process (e.g. test and API workflows),
+    // so do not retain this topology-specific state from an earlier simulation.
+    runScheduleWork.simulationWork.useGpuOpcVsites = false;
+    if (useGpuForUpdate && opcVsiteAnalysis.hasVirtualSites)
+    {
+        GMX_RELEASE_ASSERT(opcVsiteAnalysis.supported(),
+                           "GPU update accepted an unsupported OPC virtual-site topology");
+        GMX_RELEASE_ASSERT(mpiCommSimulation.size() == 1,
+                           "CUDA OPC virtual sites require one thread-MPI rank");
+        if (gpuTaskAssignments.deviceIdsAssigned().size() != 1)
+        {
+            GMX_THROW(InconsistentInputError(
+                    "CUDA OPC virtual sites require all GPU tasks to use one GPU."));
+        }
+        if (replExParams.exchangeInterval > 0)
+        {
+            GMX_THROW(InconsistentInputError(
+                    "CUDA OPC virtual sites do not support replica exchange."));
+        }
+        runScheduleWork.simulationWork.useGpuOpcVsites = true;
+    }
+
     if (GMX_LIB_MPI && deviceInfo
         && (runScheduleWork.simulationWork.useGpuDirectCommunication
             || runScheduleWork.simulationWork.useGpuPmeDecomposition
@@ -1943,7 +1977,8 @@ int Mdrunner::mdrunner()
                                "version of bonded forces.");
             fr->listedForcesGpu =
                     std::make_unique<ListedForcesGpu>(mtop.ffparams,
-                                                      fr->ic->coulomb.epsfac * fr->fudgeQQ,
+                                                      fr->ic->coulomb.epsfac,
+                                                      fr->fudgeQQ,
                                                       inputrec->opts.ngener - inputrec->nwall,
                                                       deviceStreamManager->context(),
                                                       deviceStreamManager->bondedStream(),
@@ -2291,7 +2326,10 @@ int Mdrunner::mdrunner()
                 fr->gpuForceReduction[gmx::AtomLocality::Local] = std::make_unique<gmx::GpuForceReduction>(
                         deviceStreamManager->context(),
                         deviceStreamManager->stream(gmx::DeviceStreamType::NonBondedLocal),
-                        wcycle.get());
+                        wcycle.get(),
+                        runScheduleWork.simulationWork.useGpuOpcVsites
+                                ? opcVsiteAnalysis.sites
+                                : std::vector<OpcVsiteGpuData>{});
 
                 if (runScheduleWork.simulationWork.havePpDomainDecomposition)
                 {

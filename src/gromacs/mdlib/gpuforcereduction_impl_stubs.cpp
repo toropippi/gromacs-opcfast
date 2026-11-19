@@ -67,7 +67,8 @@ class GpuForceReduction::Impl
 
 GpuForceReduction::GpuForceReduction(const DeviceContext& /* deviceContext */,
                                      const DeviceStream& /* deviceStream */,
-                                     gmx_wallcycle* /*wcycle*/) :
+                                     gmx_wallcycle* /*wcycle*/,
+                                     const std::vector<OpcVsiteGpuData>& /*opcVsites*/) :
     impl_(nullptr)
 {
     GMX_RELEASE_ASSERT(false, "A CPU stub has been called instead of the correct implementation.");

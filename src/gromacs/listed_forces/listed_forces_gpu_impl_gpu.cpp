@@ -45,6 +45,9 @@
 
 #include "gmxpre.h"
 
+#include <array>
+#include <vector>
+
 #include "gromacs/gpu_utils/device_context.h"
 #include "gromacs/gpu_utils/device_stream.h"
 #include "gromacs/gpu_utils/devicebuffer.h"
@@ -56,6 +59,7 @@
 #include "gromacs/topology/forcefieldparameters.h"
 #include "gromacs/topology/ifunc.h"
 
+#include "bonded.h"
 #include "listed_forces_gpu_impl.h"
 
 namespace gmx
@@ -86,8 +90,77 @@ static int chooseSubGroupSizeForDevice(const DeviceInformation& deviceInfo)
     }
 }
 
+#if GMX_GPU_CUDA
+/*! \brief Precompute the 16 bicubic coefficients for every cell of every CMAP grid.
+ *
+ * This follows cmap_dihs() exactly, including degree-scaled first and mixed derivatives.
+ */
+std::vector<float> makeCmapGpuCoefficients(const gmx_cmap_t& cmapGrid)
+{
+    if (cmapGrid.cmapdata.empty())
+    {
+        return {};
+    }
+
+    const int gridSpacing = cmapGrid.grid_spacing;
+    GMX_RELEASE_ASSERT(gridSpacing > 1, "A CUDA CMAP grid needs at least two points per dimension");
+
+    constexpr int c_numCoefficients = 16;
+    const int     valuesPerMap      = gridSpacing * gridSpacing * c_numCoefficients;
+    std::vector<float> coefficients(cmapGrid.cmapdata.size() * valuesPerMap);
+    const int*         coefficientMatrix = cmapCoefficientMatrix();
+    const float        dx                = 360.0F / gridSpacing;
+
+    for (std::size_t map = 0; map < cmapGrid.cmapdata.size(); map++)
+    {
+        const auto& values = cmapGrid.cmapdata[map].cmap;
+        GMX_RELEASE_ASSERT(values.size() == static_cast<std::size_t>(4 * gridSpacing * gridSpacing),
+                           "Inconsistent CUDA CMAP grid size");
+
+        for (int iphi1 = 0; iphi1 < gridSpacing; iphi1++)
+        {
+            const int ip1p1 = (iphi1 + 1) % gridSpacing;
+            for (int iphi2 = 0; iphi2 < gridSpacing; iphi2++)
+            {
+                const int ip2p1 = (iphi2 + 1) % gridSpacing;
+                const std::array<int, 4> positions = {
+                    iphi1 * gridSpacing + iphi2,
+                    ip1p1 * gridSpacing + iphi2,
+                    ip1p1 * gridSpacing + ip2p1,
+                    iphi1 * gridSpacing + ip2p1
+                };
+
+                std::array<float, c_numCoefficients> tx = {};
+                for (int corner = 0; corner < 4; corner++)
+                {
+                    const int valueIndex = 4 * positions[corner];
+                    tx[corner]           = values[valueIndex];
+                    tx[corner + 4]       = values[valueIndex + 1] * dx;
+                    tx[corner + 8]       = values[valueIndex + 2] * dx;
+                    tx[corner + 12]      = values[valueIndex + 3] * dx * dx;
+                }
+
+                const std::size_t cellOffset = map * valuesPerMap
+                                               + (iphi1 * gridSpacing + iphi2) * c_numCoefficients;
+                for (int coefficient = 0; coefficient < c_numCoefficients; coefficient++)
+                {
+                    float value = 0.0F;
+                    for (int input = 0; input < c_numCoefficients; input++)
+                    {
+                        value += coefficientMatrix[input * c_numCoefficients + coefficient] * tx[input];
+                    }
+                    coefficients[cellOffset + coefficient] = value;
+                }
+            }
+        }
+    }
+    return coefficients;
+}
+#endif
+
 ListedForcesGpu::Impl::Impl(const gmx_ffparams_t& ffparams,
-                            const float           electrostaticsScaleFactor,
+                            const float           coulombConstant,
+                            const float           fudgeQQ,
                             const int             numEnergyGroupsForListedForces,
                             const DeviceContext&  deviceContext,
                             const DeviceStream&   deviceStream,
@@ -118,11 +191,31 @@ ListedForcesGpu::Impl::Impl(const gmx_ffparams_t& ffparams,
                        deviceStream_,
                        GpuApiCallBehavior::Sync,
                        nullptr);
+#if GMX_GPU_CUDA
+    const std::vector<float> cmapCoefficients = makeCmapGpuCoefficients(ffparams.cmap_grid);
+    if (!cmapCoefficients.empty())
+    {
+        allocateDeviceBuffer(&d_cmapCoefficients_, cmapCoefficients.size(), deviceContext_);
+        copyToDeviceBuffer(&d_cmapCoefficients_,
+                           cmapCoefficients.data(),
+                           0,
+                           cmapCoefficients.size(),
+                           deviceStream_,
+                           GpuApiCallBehavior::Sync,
+                           nullptr);
+        kernelParams_.cmapGridSpacing = ffparams.cmap_grid.grid_spacing;
+        kernelParams_.cmapCoefficientsPerMap =
+                16 * ffparams.cmap_grid.grid_spacing * ffparams.cmap_grid.grid_spacing;
+        kernelBuffers_.d_cmapCoefficients = d_cmapCoefficients_;
+    }
+#endif
     vTot_.resize(static_cast<int>(InteractionFunction::Count));
     allocateDeviceBuffer(&d_vTot_, static_cast<int>(InteractionFunction::Count), deviceContext_);
     clearDeviceBufferAsync(&d_vTot_, 0, static_cast<int>(InteractionFunction::Count), deviceStream_);
 
-    kernelParams_.electrostaticsScaleFactor = electrostaticsScaleFactor;
+    kernelParams_.coulombConstant               = coulombConstant;
+    kernelParams_.fudgeQQ                       = fudgeQQ;
+    kernelParams_.electrostaticsScaleFactor = coulombConstant * fudgeQQ;
     kernelBuffers_.d_forceParams            = d_forceParams_;
     kernelBuffers_.d_vTot                   = d_vTot_;
     for (int i = 0; i < numFTypesOnGpu; i++)
@@ -167,6 +260,12 @@ ListedForcesGpu::Impl::~Impl()
         }
 
         freeDeviceBuffer(&d_forceParams_);
+#if GMX_GPU_CUDA
+        if (d_cmapCoefficients_)
+        {
+            freeDeviceBuffer(&d_cmapCoefficients_);
+        }
+#endif
         freeDeviceBuffer(&d_vTot_);
     }
     catch (gmx::InternalError& e)
@@ -390,7 +489,9 @@ void ListedForcesGpu::Impl::waitAccumulateEnergyTerms(gmx_enerdata_t* enerd)
     for (InteractionFunction fType : fTypesOnGpu)
     {
         const int ft = static_cast<int>(fType);
-        if (fType != InteractionFunction::LennardJones14 && fType != InteractionFunction::Coulomb14)
+        if (fType != InteractionFunction::LennardJones14
+            && fType != InteractionFunction::LennardJonesCoulomb14Q
+            && fType != InteractionFunction::Coulomb14)
         {
             enerd->term[ft] += vTot_[ft];
         }
@@ -399,7 +500,8 @@ void ListedForcesGpu::Impl::waitAccumulateEnergyTerms(gmx_enerdata_t* enerd)
     // Note: We do not support energy groups here
     gmx_grppairener_t* grppener = &enerd->grpp;
     grppener->energyGroupPairTerms[NonBondedEnergyTerms::LJ14][0] +=
-            vTot_[static_cast<int>(InteractionFunction::LennardJones14)];
+            vTot_[static_cast<int>(InteractionFunction::LennardJones14)]
+            + vTot_[static_cast<int>(InteractionFunction::LennardJonesCoulomb14Q)];
     grppener->energyGroupPairTerms[NonBondedEnergyTerms::Coulomb14][0] +=
             vTot_[static_cast<int>(InteractionFunction::Coulomb14)];
 }
@@ -416,12 +518,13 @@ void ListedForcesGpu::Impl::clearEnergies()
 // ---- ListedForcesGpu
 
 ListedForcesGpu::ListedForcesGpu(const gmx_ffparams_t& ffparams,
-                                 const float           electrostaticsScaleFactor,
+                                 const float           coulombConstant,
+                                 const float           fudgeQQ,
                                  const int             numEnergyGroupsForListedForces,
                                  const DeviceContext&  deviceContext,
                                  const DeviceStream&   deviceStream,
                                  gmx_wallcycle*        wcycle) :
-    impl_(new Impl(ffparams, electrostaticsScaleFactor, numEnergyGroupsForListedForces, deviceContext, deviceStream, wcycle))
+    impl_(new Impl(ffparams, coulombConstant, fudgeQQ, numEnergyGroupsForListedForces, deviceContext, deviceStream, wcycle))
 {
 }
 

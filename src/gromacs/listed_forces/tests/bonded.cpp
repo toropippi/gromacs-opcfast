@@ -63,6 +63,7 @@
 #include <gtest/gtest.h>
 
 #include "gromacs/listed_forces/listed_forces.h"
+#include "gromacs/listed_forces/listed_forces_gpu.h"
 #include "gromacs/math/paddedvector.h"
 #include "gromacs/math/units.h"
 #include "gromacs/mdtypes/md_enums.h"
@@ -89,6 +90,113 @@ namespace test
 {
 namespace
 {
+
+#if GMX_GPU_CUDA
+TEST(CmapGpuSetupTest, PrecomputedCoefficientsReproducePeriodicGridCornersAndDerivatives)
+{
+    constexpr int c_gridSpacing  = 4;
+    constexpr int c_numMaps      = 2;
+    constexpr int c_valuesPerCell = 16;
+    const float   dx               = 360.0F / c_gridSpacing;
+
+    gmx_cmap_t cmapGrid;
+    cmapGrid.grid_spacing = c_gridSpacing;
+    cmapGrid.cmapdata.resize(c_numMaps);
+    for (int map = 0; map < c_numMaps; map++)
+    {
+        auto& values = cmapGrid.cmapdata[map].cmap;
+        values.resize(4 * c_gridSpacing * c_gridSpacing);
+        for (int i = 0; i < c_gridSpacing; i++)
+        {
+            for (int j = 0; j < c_gridSpacing; j++)
+            {
+                const int offset = 4 * (i * c_gridSpacing + j);
+                values[offset]     = 0.2F * map + 0.1F * i - 0.07F * j;
+                values[offset + 1] = 0.002F * (1 + map + 2 * i - j);
+                values[offset + 2] = -0.001F * (2 + map - i + 3 * j);
+                values[offset + 3] = 0.00001F * (1 + map + i + j);
+            }
+        }
+    }
+
+    const std::vector<float> coefficients = makeCmapGpuCoefficients(cmapGrid);
+    ASSERT_EQ(coefficients.size(),
+              static_cast<std::size_t>(c_numMaps * c_gridSpacing * c_gridSpacing
+                                       * c_valuesPerCell));
+
+    auto evaluate = [](const float* c, float t, float u, int derivativeT, int derivativeU)
+    {
+        float result = 0.0F;
+        for (int i = derivativeT; i < 4; i++)
+        {
+            for (int j = derivativeU; j < 4; j++)
+            {
+                const float factorT = derivativeT == 0 ? 1.0F : static_cast<float>(i);
+                const float factorU = derivativeU == 0 ? 1.0F : static_cast<float>(j);
+                result += c[4 * i + j] * factorT * factorU
+                          * std::pow(t, i - derivativeT) * std::pow(u, j - derivativeU);
+            }
+        }
+        return result;
+    };
+
+    constexpr float c_tolerance = 3.0e-5F;
+    for (int map = 0; map < c_numMaps; map++)
+    {
+        const auto& values = cmapGrid.cmapdata[map].cmap;
+        for (int i = 0; i < c_gridSpacing; i++)
+        {
+            const int ip1 = (i + 1) % c_gridSpacing;
+            for (int j = 0; j < c_gridSpacing; j++)
+            {
+                const int jp1 = (j + 1) % c_gridSpacing;
+                const float* c = coefficients.data()
+                                 + (map * c_gridSpacing * c_gridSpacing
+                                    + i * c_gridSpacing + j)
+                                           * c_valuesPerCell;
+                const std::array<std::array<int, 2>, 4> gridCorners = {
+                    std::array<int, 2>{ i, j },
+                    std::array<int, 2>{ ip1, j },
+                    std::array<int, 2>{ ip1, jp1 },
+                    std::array<int, 2>{ i, jp1 }
+                };
+                const std::array<std::array<float, 2>, 4> localCorners = {
+                    std::array<float, 2>{ 0.0F, 0.0F },
+                    std::array<float, 2>{ 1.0F, 0.0F },
+                    std::array<float, 2>{ 1.0F, 1.0F },
+                    std::array<float, 2>{ 0.0F, 1.0F }
+                };
+                for (int corner = 0; corner < 4; corner++)
+                {
+                    const int valueOffset =
+                            4 * (gridCorners[corner][0] * c_gridSpacing + gridCorners[corner][1]);
+                    const float t = localCorners[corner][0];
+                    const float u = localCorners[corner][1];
+                    EXPECT_NEAR(evaluate(c, t, u, 0, 0), values[valueOffset], c_tolerance);
+                    EXPECT_NEAR(evaluate(c, t, u, 1, 0), values[valueOffset + 1] * dx, c_tolerance);
+                    EXPECT_NEAR(evaluate(c, t, u, 0, 1), values[valueOffset + 2] * dx, c_tolerance);
+                    EXPECT_NEAR(evaluate(c, t, u, 1, 1),
+                                values[valueOffset + 3] * dx * dx,
+                                c_tolerance);
+                }
+            }
+        }
+    }
+}
+
+TEST(CmapGpuSetupTest, CudaListedForceTypesContainCmapInSortedOrder)
+{
+    EXPECT_NE(std::find(fTypesOnGpu.begin(),
+                        fTypesOnGpu.end(),
+                        InteractionFunction::DihedralEnergyCorrectionMap),
+              fTypesOnGpu.end());
+    EXPECT_NE(std::find(fTypesOnGpu.begin(),
+                        fTypesOnGpu.end(),
+                        InteractionFunction::LennardJonesCoulomb14Q),
+              fTypesOnGpu.end());
+    EXPECT_TRUE(std::is_sorted(fTypesOnGpu.begin(), fTypesOnGpu.end()));
+}
+#endif
 
 //! Number of atoms used in these tests.
 constexpr int c_numAtoms = 4;

@@ -403,8 +403,15 @@ void gpu_launch_free_energy_kernel(NbnxmGpu*                      nb,
 
     if (GMX_NATIVE_WINDOWS)
     {
-        /* Windows: force flushing WDDM queue */
-        cudaStreamQuery(deviceStream.stream());
+        /* Windows: force flushing the WDDM queue, except while CUDA Graph
+         * capture is active. cudaStreamQuery is prohibited during capture
+         * and invalidates the whole graph. */
+        cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(deviceStream.stream(), &captureStatus);
+        if (captureStatus == cudaStreamCaptureStatusNone)
+        {
+            cudaStreamQuery(deviceStream.stream());
+        }
     }
 }
 

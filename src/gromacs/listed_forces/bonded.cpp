@@ -3141,6 +3141,11 @@ void accumulateCmapForces(const rvec      x[],
 
 } // namespace
 
+const int* cmapCoefficientMatrix()
+{
+    return cmap_coeff_matrix;
+}
+
 real cmap_dihs(int                 nbonds,
                const t_iatom       forceatoms[],
                const t_iparams     forceparams[],

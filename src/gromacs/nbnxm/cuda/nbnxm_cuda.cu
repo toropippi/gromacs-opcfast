@@ -623,8 +623,15 @@ void gpu_launch_kernel(NbnxmGpu* nb, const gmx::StepWorkload& stepWork, const In
 
     if (GMX_NATIVE_WINDOWS)
     {
-        /* Windows: force flushing WDDM queue */
-        cudaStreamQuery(deviceStream.stream());
+        /* Windows: force flushing the WDDM queue, except while CUDA Graph
+         * capture is active. cudaStreamQuery is prohibited during capture
+         * and invalidates the whole graph. */
+        cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(deviceStream.stream(), &captureStatus);
+        if (captureStatus == cudaStreamCaptureStatusNone)
+        {
+            cudaStreamQuery(deviceStream.stream());
+        }
     }
 }
 
@@ -785,8 +792,15 @@ void gpu_launch_kernel_pruneonly(NbnxmGpu* nb, const InteractionLocality iloc, c
 
     if (GMX_NATIVE_WINDOWS)
     {
-        /* Windows: force flushing WDDM queue */
-        cudaStreamQuery(deviceStream.stream());
+        /* Windows: force flushing the WDDM queue, except while CUDA Graph
+         * capture is active. cudaStreamQuery is prohibited during capture
+         * and invalidates the whole graph. */
+        cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(deviceStream.stream(), &captureStatus);
+        if (captureStatus == cudaStreamCaptureStatusNone)
+        {
+            cudaStreamQuery(deviceStream.stream());
+        }
     }
 }
 

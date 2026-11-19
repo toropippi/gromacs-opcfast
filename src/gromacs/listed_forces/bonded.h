@@ -131,6 +131,13 @@ real cmap_dihs(int                 nbonds,
                t_oriresdata gmx_unused* oriresdata,
                int gmx_unused*          global_atom_index);
 
+/*! \brief Return the 16-by-16 integer transform used for bicubic CMAP coefficients.
+ *
+ * The returned row-major array has 256 entries. The CUDA setup path uses this accessor so its
+ * precomputed spline coefficients are generated with exactly the CPU transform.
+ */
+const int* cmapCoefficientMatrix();
+
 /*! \brief For selecting which flavor of bonded kernel is used for simple bonded types */
 enum class BondedKernelFlavor
 {

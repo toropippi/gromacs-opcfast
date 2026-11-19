@@ -61,6 +61,8 @@
 #include "gromacs/gpu_utils/gpueventsynchronizer.h"
 #include "gromacs/gpu_utils/gputraits.h"
 #include "gromacs/mdlib/leapfrog_gpu.h"
+#include "gromacs/mdlib/opc_vsite_gpu.h"
+#include "gromacs/mdlib/opc_vsite_support.h"
 #include "gromacs/mdlib/update_constrain_gpu.h"
 #include "gromacs/mdlib/update_constrain_gpu_internal.h"
 #include "gromacs/mdtypes/mdatom.h"
@@ -101,6 +103,14 @@ void UpdateConstrainGpu::Impl::integrate(GpuEventSynchronizer*             fRead
         {
             lincsGpu_->apply(d_x0_, d_x_, updateVelocities, d_v_, 1.0 / dt, computeVirial, virial, pbcAiuc_);
             settleGpu_->apply(d_x0_, d_x_, updateVelocities, d_v_, 1.0 / dt, computeVirial, virial, pbcAiuc_);
+        }
+
+        if (opcVsites_)
+        {
+            // SETTLE has produced final O/H coordinates and velocities. Construct EPW before
+            // recording xUpdatedOnDeviceEvent_, so all downstream GPU work observes valid sites.
+            opcVsites_->constructPositions(d_x_, pbcAiuc_);
+            opcVsites_->constructVelocities(d_v_);
         }
 
         // scaledVirial -> virial (methods above returns scaled values)
@@ -169,6 +179,14 @@ UpdateConstrainGpu::Impl::Impl(const t_inputrec&    ir,
     {
         lincsGpu_ = std::make_unique<LincsGpu>(ir.nLincsIter, ir.nProjOrder, deviceContext_, deviceStream_);
         settleGpu_ = std::make_unique<SettleGpu>(mtop, deviceContext_, deviceStream_);
+        const OpcVsiteAnalysis opcVsiteAnalysis = analyzeOpcGpuVsites(mtop);
+        GMX_RELEASE_ASSERT(!opcVsiteAnalysis.hasVirtualSites || opcVsiteAnalysis.supported(),
+                           "Unsupported virtual sites reached CUDA update construction");
+        if (opcVsiteAnalysis.hasVirtualSites)
+        {
+            opcVsites_ = std::make_unique<OpcVsiteGpu>(
+                    opcVsiteAnalysis.sites, deviceContext_, deviceStream_);
+        }
     }
 }
 

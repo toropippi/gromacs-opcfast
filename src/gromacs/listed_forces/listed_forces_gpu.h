@@ -47,7 +47,11 @@
 #ifndef GMX_LISTED_FORCES_LISTED_FORCES_GPU_H
 #define GMX_LISTED_FORCES_LISTED_FORCES_GPU_H
 
+#include "config.h"
+
+#include <array>
 #include <memory>
+#include <vector>
 
 #include "gromacs/gpu_utils/devicebuffer_datatype.h"
 #include "gromacs/pbcutil/pbc.h"
@@ -58,6 +62,7 @@ class DeviceContext;
 class DeviceStream;
 
 struct gmx_enerdata_t;
+struct gmx_cmap_t;
 struct gmx_ffparams_t;
 struct gmx_mtop_t;
 struct t_inputrec;
@@ -71,8 +76,17 @@ template<typename>
 class ArrayRef;
 class StepWorkload;
 
-/*! \brief The number on bonded function types supported on GPUs */
+/*! \brief The number of bonded function types supported on GPUs.
+ *
+ * CMAP is initially supported only by the CUDA backend. Keeping the list
+ * backend-specific prevents other GPU backends from silently accepting work
+ * for which they do not have a kernel implementation.
+ */
+#if GMX_GPU_CUDA
+static constexpr int numFTypesOnGpu = 10;
+#else
 static constexpr int numFTypesOnGpu = 8;
+#endif
 
 /*! \brief List of all bonded function types supported on GPUs
  *
@@ -89,8 +103,22 @@ constexpr std::array<InteractionFunction, numFTypesOnGpu> fTypesOnGpu = {
     InteractionFunction::RyckaertBellemansDihedrals,
     InteractionFunction::ImproperDihedrals,
     InteractionFunction::PeriodicImproperDihedrals,
-    InteractionFunction::LennardJones14
+#if GMX_GPU_CUDA
+    InteractionFunction::DihedralEnergyCorrectionMap,
+#endif
+    InteractionFunction::LennardJones14,
+#if GMX_GPU_CUDA
+    InteractionFunction::LennardJonesCoulomb14Q
+#endif
 };
+
+#if GMX_GPU_CUDA
+/*! \brief Precompute CUDA CMAP bicubic coefficients from a topology CMAP grid.
+ *
+ * Exposed internally so the host-side transform and periodic cell layout can be unit tested.
+ */
+std::vector<float> makeCmapGpuCoefficients(const gmx_cmap_t& cmapGrid);
+#endif
 
 /*! \brief Checks whether the GROMACS build allows to compute bonded interactions on a GPU.
  *
@@ -118,9 +146,9 @@ public:
     /*! \brief Construct the manager with constant data and the stream to use.
      *
      * \param[in] ffparams                   Force-field parameters.
-     * \param[in] electrostaticsScaleFactor  Scaling factor for the electrostatic potential
-     * \param[in] numEnergyGroupsForListedForces  The number of energy groups used for listed forces
-     *                                       (Coulomb constant, multiplied by the Fudge factor).
+     * \param[in] coulombConstant            Coulomb conversion factor for the electrostatic potential
+     * \param[in] fudgeQQ                    Global 1-4 electrostatic scaling factor
+     * \param[in] numEnergyGroupsForListedForces  The number of energy groups used for listed forces.
      * \param[in] deviceContext              GPU device context.
      * \param[in] deviceStream               GPU device stream.
      * \param[in] wcycle                     The wallclock counter.
@@ -129,7 +157,8 @@ public:
      *       Passing numEnergyGroupsForListedForces>1 will lead to an assertion failure.
      */
     ListedForcesGpu(const gmx_ffparams_t& ffparams,
-                    float                 electrostaticsScaleFactor,
+                    float                 coulombConstant,
+                    float                 fudgeQQ,
                     int                   numEnergyGroupsForListedForces,
                     const DeviceContext&  deviceContext,
                     const DeviceStream&   deviceStream,

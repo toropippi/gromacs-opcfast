@@ -1620,7 +1620,19 @@ void do_force(FILE*                         fplog,
 
     if (stepWork.doNeighborSearch)
     {
-        doPairSearch(cr, inputrec, mdModulesNotifiers, step, nrnb, wcycle, *top, box, x, v, *mdatoms, fr, runScheduleWork);
+        doPairSearch(cr,
+                     inputrec,
+                     mdModulesNotifiers,
+                     step,
+                     nrnb,
+                     wcycle,
+                     *top,
+                     box,
+                     x,
+                     v,
+                     *mdatoms,
+                     fr,
+                     runScheduleWork);
 
         /* At a search step we need to start the first balancing region
          * somewhere early inside the step after communication during domain

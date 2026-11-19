@@ -410,7 +410,6 @@ NbnxnPairlistGpu::NbnxnPairlistGpu(PinningPolicy pinningPolicy) :
 static std::vector<NbnxnPairlistGpu> createGpuPairlists(int numLists, PinningPolicy pinPolicy)
 {
     auto lists = std::vector<NbnxnPairlistGpu>();
-    /* Only list 0 is used on the GPU, use normal allocation for i>0 */
     lists.emplace_back(NbnxnPairlistGpu{ pinPolicy });
     /* Lists 0 to numLists are use for constructing lists in parallel
      * on the CPU using numLists threads (and then merged into list 0).
@@ -426,7 +425,7 @@ static std::vector<NbnxnPairlistGpu> createGpuPairlists(int numLists, PinningPol
 // TODO: Move to pairlistset.cpp
 PairlistSet::PairlistSet(const PairlistParams& pairlistParams, PinningPolicy pinPolicy) :
     params_(pairlistParams),
-    combineLists_(sc_isGpuSpecificPairlist(pairlistParams.pairlistType)), // Currently GPU lists are always combined
+    combineLists_(sc_isGpuSpecificPairlist(pairlistParams.pairlistType)),
     isCpuType_(!sc_isGpuSpecificPairlist(pairlistParams.pairlistType))
 {
 
@@ -3899,22 +3898,7 @@ void PairlistSet::constructPairlists(InteractionLocality      locality,
     else
     {
         /* Sort the entries on size, large ones first */
-        if (combineLists_ || gpuLists_.size() == 1)
-        {
-            sort_sci(&gpuLists_[0]);
-        }
-        else
-        {
-#pragma omp parallel for num_threads(numLists) schedule(static)
-            for (int th = 0; th < numLists; th++)
-            {
-                try
-                {
-                    sort_sci(&gpuLists_[th]);
-                }
-                GMX_CATCH_ALL_AND_EXIT_WITH_FATAL_ERROR
-            }
-        }
+        sort_sci(&gpuLists_[0]);
     }
 
     if (nbat->useBufferFlags())

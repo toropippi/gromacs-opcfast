@@ -47,6 +47,7 @@ list(REMOVE_ITEM MDLIB_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/lincs_gpu_internal_hip.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/lincs_gpu_internal_sycl.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/mdgraph_gpu_impl_sycl.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/opc_vsite_gpu.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/settle_gpu.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/settle_gpu_internal_hip.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/settle_gpu_internal_sycl.cpp
@@ -68,6 +69,8 @@ if(GMX_GPU_CUDA)
        update_constrain_gpu_impl.cpp
        update_constrain_gpu_internal.cu
        mdgraph_gpu_impl.cu
+       opc_vsite_gpu.cpp
+       opc_vsite_gpu_internal.cu
        )
     # Clang-18 seems to emit bad ptx for this file, so we omit it from
     # the CI build that does clang-tidy analysis of a CUDA build.
@@ -78,6 +81,7 @@ if(GMX_GPU_CUDA)
        gpuforcereduction_impl.cpp
        leapfrog_gpu.cpp
        lincs_gpu.cpp
+       opc_vsite_gpu.cpp
        settle_gpu.cpp
        update_constrain_gpu_impl.cpp
        )

@@ -108,10 +108,12 @@ void launchForceReductionKernel(int                    numAtoms,
                                 DeviceBuffer<int>      d_cell,
                                 const DeviceStream&    deviceStream,
                                 DeviceBuffer<uint64_t> d_forcesReadyNvshmemFlags,
-                                const uint64_t         forcesReadyNvshmemFlagsCounter)
+                                const uint64_t         forcesReadyNvshmemFlagsCounter,
+                                const OpcVsiteForceReductionFusion opcVsiteFusion)
 {
     GMX_UNUSED_VALUE(d_forcesReadyNvshmemFlags);
     GMX_UNUSED_VALUE(forcesReadyNvshmemFlagsCounter);
+    GMX_UNUSED_VALUE(opcVsiteFusion);
 
     float3*       d_baseForcePtr      = &(asFloat3(d_baseForce)[atomStart]);
     const float3* d_nbnxmForcePtr     = asFloat3(d_nbnxmForceToAdd);

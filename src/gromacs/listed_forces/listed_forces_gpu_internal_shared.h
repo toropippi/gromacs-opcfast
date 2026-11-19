@@ -98,10 +98,14 @@ constexpr float        c_Pi       = M_PI;
 template<typename T>
 struct FTypeArray
 {
-    static_assert(gmx::numFTypesOnGpu == 8,
+    static_assert(gmx::numFTypesOnGpu == 8 || gmx::numFTypesOnGpu == 10,
                   "Please update the member initializer list and the switch below");
     constexpr FTypeArray(const T in[gmx::numFTypesOnGpu]) :
-        data{ in[0], in[1], in[2], in[3], in[4], in[5], in[6], in[7] }
+        data{ in[0], in[1], in[2], in[3], in[4], in[5], in[6], in[7]
+#if GMX_GPU_CUDA
+              , in[8], in[9]
+#endif
+        }
     {
     }
     GMX_DEVICE_FUNC_ATTRIBUTE constexpr T operator[](int idx) const
@@ -115,7 +119,13 @@ struct FTypeArray
             case 4: return data[4];
             case 5: return data[5];
             case 6: return data[6];
+            case 7: return data[7];
+#if GMX_GPU_CUDA
+            case 8: return data[8];
+            default: return data[9];
+#else
             default: return data[7];
+#endif
         }
     }
     T data[gmx::numFTypesOnGpu];
@@ -535,6 +545,151 @@ GMX_DEVICE_FUNC_ATTRIBUTE static inline void do_dih_fup_gpu(const int           
     }
 }
 
+#if GMX_GPU_CUDA
+/*! \brief Evaluate one CHARMM CMAP interaction on CUDA.
+ *
+ * The coefficient buffer contains 16 bicubic coefficients for every periodic grid cell,
+ * precomputed on the host with the same transform used by cmap_dihs().
+ */
+template<bool calcVir, bool calcEner>
+GMX_DEVICE_FUNC_ATTRIBUTE static inline void cmap_gpu(
+        const int                                      interactionIndex,
+        DevicePrivatePtr<float>                        vtotLoc,
+        const DeviceGlobalPtr<const t_iatom>           forceAtoms,
+        const DeviceGlobalPtr<const t_iparams>         forceParameters,
+        const DeviceGlobalPtr<const float>             cmapCoefficients,
+        const int                                      gridSpacing,
+        const int                                      coefficientsPerMap,
+        const DeviceGlobalPtr<const DeviceFloat4>      xq,
+        DeviceGlobalPtr<DeviceFloat3>                  force,
+        DeviceLocalPtr<DeviceFloat3>                   shiftForce,
+        const PbcAiuc&                                 pbcAiuc,
+        const int                                      localId)
+{
+    constexpr int c_stride = 6;
+    const int     type     = forceAtoms[c_stride * interactionIndex];
+    const int     ai       = forceAtoms[c_stride * interactionIndex + 1];
+    const int     aj       = forceAtoms[c_stride * interactionIndex + 2];
+    const int     ak       = forceAtoms[c_stride * interactionIndex + 3];
+    const int     al       = forceAtoms[c_stride * interactionIndex + 4];
+    const int     am       = forceAtoms[c_stride * interactionIndex + 5];
+
+    DeviceFloat3 r1Ij, r1Kj, r1Kl, m1, n1;
+    DeviceFloat3 r2Ij, r2Kj, r2Kl, m2, n2;
+    int          t11, t21, t31, t12, t22, t32;
+
+    const float phi1 = dih_angle_gpu<calcVir>(
+            xq[ai], xq[aj], xq[ak], xq[al], pbcAiuc, &r1Ij, &r1Kj, &r1Kl, &m1, &n1, &t11, &t21, &t31);
+    const float phi2 = dih_angle_gpu<calcVir>(
+            xq[aj], xq[ak], xq[al], xq[am], pbcAiuc, &r2Ij, &r2Kj, &r2Kl, &m2, &n2, &t12, &t22, &t32);
+
+    constexpr float twoPi = 2.0F * c_Pi;
+    float xphi1 = phi1 + c_Pi;
+    float xphi2 = phi2 + c_Pi;
+    if (xphi1 < 0.0F)
+    {
+        xphi1 += twoPi;
+    }
+    else if (xphi1 >= twoPi)
+    {
+        xphi1 -= twoPi;
+    }
+    if (xphi2 < 0.0F)
+    {
+        xphi2 += twoPi;
+    }
+    else if (xphi2 >= twoPi)
+    {
+        xphi2 -= twoPi;
+    }
+
+    const float gridScale = static_cast<float>(gridSpacing) / twoPi;
+    const float gridPhi1  = xphi1 * gridScale;
+    const float gridPhi2  = xphi2 * gridScale;
+    int         iphi1     = static_cast<int>(gridPhi1);
+    int         iphi2     = static_cast<int>(gridPhi2);
+    float       tt        = gridPhi1 - static_cast<float>(iphi1);
+    float       tu        = gridPhi2 - static_cast<float>(iphi2);
+    // Protect against a final-bit rounding to gridSpacing at the periodic boundary.
+    if (iphi1 == gridSpacing)
+    {
+        iphi1 = 0;
+        tt    = 0.0F;
+    }
+    if (iphi2 == gridSpacing)
+    {
+        iphi2 = 0;
+        tu    = 0.0F;
+    }
+
+    const int cmapType = forceParameters[type].cmap.cmapA;
+    const DeviceGlobalPtr<const float> coefficients =
+            cmapCoefficients + cmapType * coefficientsPerMap
+            + (iphi1 * gridSpacing + iphi2) * 16;
+
+    float energy = 0.0F;
+    float df1    = 0.0F;
+    float df2    = 0.0F;
+    for (int i = 3; i >= 0; i--)
+    {
+        const int row = 4 * i;
+        energy = tt * energy
+                 + ((coefficients[row + 3] * tu + coefficients[row + 2]) * tu
+                    + coefficients[row + 1])
+                           * tu
+                 + coefficients[row];
+        df1 = tu * df1
+              + (3.0F * coefficients[12 + i] * tt + 2.0F * coefficients[8 + i]) * tt
+              + coefficients[4 + i];
+        df2 = tt * df2
+              + (3.0F * coefficients[row + 3] * tu + 2.0F * coefficients[row + 2]) * tu
+              + coefficients[row + 1];
+    }
+    df1 *= gridScale;
+    df2 *= gridScale;
+
+    if constexpr (calcEner)
+    {
+        *vtotLoc += energy;
+    }
+
+    do_dih_fup_gpu<calcVir>(ai,
+                            aj,
+                            ak,
+                            al,
+                            df1,
+                            r1Ij,
+                            r1Kj,
+                            r1Kl,
+                            m1,
+                            n1,
+                            force,
+                            shiftForce,
+                            pbcAiuc,
+                            xq,
+                            t11,
+                            t21,
+                            localId);
+    do_dih_fup_gpu<calcVir>(aj,
+                            ak,
+                            al,
+                            am,
+                            df2,
+                            r2Ij,
+                            r2Kj,
+                            r2Kl,
+                            m2,
+                            n2,
+                            force,
+                            shiftForce,
+                            pbcAiuc,
+                            xq,
+                            t12,
+                            t22,
+                            localId);
+}
+#endif
+
 template<bool calcVir, bool calcEner>
 GMX_DEVICE_FUNC_ATTRIBUTE static inline void pdihs_gpu(const int               i,
                                                        DevicePrivatePtr<float> vtot_loc,
@@ -747,7 +902,7 @@ GMX_DEVICE_FUNC_ATTRIBUTE static inline void idihs_gpu(const int               i
     }
 }
 
-template<bool calcVir, bool calcEner>
+template<bool calcVir, bool calcEner, bool useExplicitPairParameters = false>
 GMX_DEVICE_FUNC_ATTRIBUTE static inline void pairs_gpu(const int i,
                                                        const DeviceGlobalPtr<const t_iatom> gm_forceatoms,
                                                        const DeviceGlobalPtr<const t_iparams> gm_iparams,
@@ -755,7 +910,8 @@ GMX_DEVICE_FUNC_ATTRIBUTE static inline void pairs_gpu(const int i,
                                                        DeviceGlobalPtr<DeviceFloat3> gm_f,
                                                        DeviceLocalPtr<DeviceFloat3>  sm_fShiftLoc,
                                                        const PbcAiuc&                pbcAiuc,
-                                                       const float                   scale_factor,
+                                                       const float                   coulombConstant,
+                                                       const float                   fudgeQQ,
                                                        DevicePrivatePtr<float>       vtot_loc,
                                                        DevicePrivatePtr<float>       vtotElec_loc,
                                                        const int                     localId)
@@ -764,9 +920,24 @@ GMX_DEVICE_FUNC_ATTRIBUTE static inline void pairs_gpu(const int i,
     int ai   = gm_forceatoms[3 * i + 1];
     int aj   = gm_forceatoms[3 * i + 2];
 
-    float qq  = gm_xq[ai][3] * gm_xq[aj][3];
-    float c6  = gm_iparams[type].lj14.c6A;
-    float c12 = gm_iparams[type].lj14.c12A;
+    float qq;
+    float c6;
+    float c12;
+    float electrostaticsScaleFactor;
+    if constexpr (useExplicitPairParameters)
+    {
+        qq                          = gm_iparams[type].ljc14.qi * gm_iparams[type].ljc14.qj;
+        c6                          = gm_iparams[type].ljc14.c6;
+        c12                         = gm_iparams[type].ljc14.c12;
+        electrostaticsScaleFactor = coulombConstant * gm_iparams[type].ljc14.fqq;
+    }
+    else
+    {
+        qq                          = gm_xq[ai][3] * gm_xq[aj][3];
+        c6                          = gm_iparams[type].lj14.c6A;
+        c12                         = gm_iparams[type].lj14.c12A;
+        electrostaticsScaleFactor = coulombConstant * fudgeQQ;
+    }
 
     /* Do we need to apply full periodic boundary conditions? */
     DeviceFloat3 dr;
@@ -778,7 +949,7 @@ GMX_DEVICE_FUNC_ATTRIBUTE static inline void pairs_gpu(const int i,
     float rinv6 = rinv2 * rinv2 * rinv2;
 
     /* Calculate the Coulomb force * r */
-    float velec = scale_factor * qq * rinv;
+    float velec = electrostaticsScaleFactor * qq * rinv;
 
     /* Calculate the LJ force * r and add it to the Coulomb part */
     float fr = (12.0F * c12 * rinv6 - 6.0F * c6) * rinv6 + velec;
@@ -805,6 +976,35 @@ GMX_DEVICE_FUNC_ATTRIBUTE static inline void pairs_gpu(const int i,
         *vtot_loc += (c12 * rinv6 - c6) * rinv6;
         *vtotElec_loc += velec;
     }
+}
+
+/*! \brief Compatibility overload for GPU backends that currently support only standard LJ-14. */
+template<bool calcVir, bool calcEner>
+GMX_DEVICE_FUNC_ATTRIBUTE static inline void pairs_gpu(
+        const int                                      i,
+        const DeviceGlobalPtr<const t_iatom>           gm_forceatoms,
+        const DeviceGlobalPtr<const t_iparams>         gm_iparams,
+        const DeviceGlobalPtr<const DeviceFloat4>      gm_xq,
+        DeviceGlobalPtr<DeviceFloat3>                  gm_f,
+        DeviceLocalPtr<DeviceFloat3>                   sm_fShiftLoc,
+        const PbcAiuc&                                 pbcAiuc,
+        const float                                    electrostaticsScaleFactor,
+        DevicePrivatePtr<float>                        vtot_loc,
+        DevicePrivatePtr<float>                        vtotElec_loc,
+        const int                                      localId)
+{
+    pairs_gpu<calcVir, calcEner, false>(i,
+                                        gm_forceatoms,
+                                        gm_iparams,
+                                        gm_xq,
+                                        gm_f,
+                                        sm_fShiftLoc,
+                                        pbcAiuc,
+                                        electrostaticsScaleFactor,
+                                        1.0F,
+                                        vtot_loc,
+                                        vtotElec_loc,
+                                        localId);
 }
 
 } // namespace gmx

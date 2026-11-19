@@ -58,20 +58,23 @@ namespace gmx
 
 constexpr static int c_threadsPerBlock = 128;
 
-template<bool addRvecForce, bool accumulateForce>
+template<bool addRvecForce, bool accumulateForce, bool fuseOpcVsiteForces>
 static __global__ void reduceKernel(const float3* __restrict__ gm_nbnxmForce,
                                     const float3* __restrict__ rvecForceToAdd,
                                     float3*    gm_fTotal,
                                     const int* gm_cell,
                                     const int  numAtoms,
                                     uint64_t* forcesReadyNvshmemFlags, // NOLINT(readability-non-const-parameter)
-                                    const uint64_t forcesReadyNvshmemFlagsCounter)
+                                    const uint64_t forcesReadyNvshmemFlagsCounter,
+                                    const OpcVsiteForceReductionFusion opcVsiteFusion)
 {
     // map particle-level parallelism to 1D CUDA thread and block index
     const int threadIndex = blockIdx.x * blockDim.x + threadIdx.x;
 
     float3* gm_fDest = &gm_fTotal[threadIndex];
     float3  temp;
+    float3  epTemp;
+    int     atomWithinWater = -1;
 
     if (addRvecForce && forcesReadyNvshmemFlags)
     {
@@ -99,6 +102,22 @@ static __global__ void reduceKernel(const float3* __restrict__ gm_nbnxmForce,
         {
             temp = gm_nbnxmForce[gm_cell[threadIndex]];
         }
+
+        if constexpr (fuseOpcVsiteForces)
+        {
+            const int opcAtomOffset = threadIndex - opcVsiteFusion.atomStart;
+            if (opcAtomOffset >= 0 && opcAtomOffset < 4 * opcVsiteFusion.numSites)
+            {
+                atomWithinWater = opcAtomOffset & 3;
+                if (atomWithinWater != 3)
+                {
+                    const int epAtom = threadIndex + 3 - atomWithinWater;
+                    // This fused path is selected only when accumulateForce is false,
+                    // so no concurrently written destination force needs to be read.
+                    epTemp = gm_nbnxmForce[gm_cell[epAtom]];
+                }
+            }
+        }
     }
 
     if (addRvecForce && forcesReadyNvshmemFlags)
@@ -113,6 +132,29 @@ static __global__ void reduceKernel(const float3* __restrict__ gm_nbnxmForce,
         if (addRvecForce)
         {
             temp += rvecForceToAdd[threadIndex];
+            if constexpr (fuseOpcVsiteForces)
+            {
+                if (atomWithinWater >= 0 && atomWithinWater != 3)
+                {
+                    epTemp += rvecForceToAdd[threadIndex + 3 - atomWithinWater];
+                }
+            }
+        }
+
+        if constexpr (fuseOpcVsiteForces)
+        {
+            if (atomWithinWater == 3)
+            {
+                temp = make_float3(0.0F, 0.0F, 0.0F);
+            }
+            else if (atomWithinWater >= 0)
+            {
+                const float weight = atomWithinWater == 0
+                                             ? 1.0F - opcVsiteFusion.weightH1 - opcVsiteFusion.weightH2
+                                             : (atomWithinWater == 1 ? opcVsiteFusion.weightH1
+                                                                     : opcVsiteFusion.weightH2);
+                temp += epTemp * weight;
+            }
         }
 
         *gm_fDest = temp;
@@ -129,7 +171,8 @@ void launchForceReductionKernel(int                        numAtoms,
                                 DeviceBuffer<int>          d_cell,
                                 const DeviceStream&        deviceStream,
                                 DeviceBuffer<uint64_t>     d_forcesReadyNvshmemFlags,
-                                const uint64_t             forcesReadyNvshmemFlagsCounter)
+                                const uint64_t             forcesReadyNvshmemFlagsCounter,
+                                const OpcVsiteForceReductionFusion opcVsiteFusion)
 {
     float3* d_baseForcePtr      = &(asFloat3(d_baseForce)[atomStart]);
     float3* d_nbnxmForcePtr     = asFloat3(d_nbnxmForceToAdd);
@@ -145,9 +188,15 @@ void launchForceReductionKernel(int                        numAtoms,
     config.gridSize[2]      = 1;
     config.sharedMemorySize = 0;
 
-    auto kernelFn = addRvecForce
-                            ? (accumulate ? reduceKernel<true, true> : reduceKernel<true, false>)
-                            : (accumulate ? reduceKernel<false, true> : reduceKernel<false, false>);
+    const bool fuseOpcVsiteForces = opcVsiteFusion.enabled();
+    auto kernelFn = fuseOpcVsiteForces
+                            ? (addRvecForce ? reduceKernel<true, false, true>
+                                            : reduceKernel<false, false, true>)
+                            : (addRvecForce
+                                       ? (accumulate ? reduceKernel<true, true, false>
+                                                     : reduceKernel<true, false, false>)
+                                       : (accumulate ? reduceKernel<false, true, false>
+                                                     : reduceKernel<false, false, false>));
 
     const auto kernelArgs = prepareGpuKernelArguments(kernelFn,
                                                       config,
@@ -157,7 +206,8 @@ void launchForceReductionKernel(int                        numAtoms,
                                                       &d_cell,
                                                       &numAtoms,
                                                       &d_forcesReadyNvshmemFlags,
-                                                      &forcesReadyNvshmemFlagsCounter);
+                                                      &forcesReadyNvshmemFlagsCounter,
+                                                      &opcVsiteFusion);
 
     launchGpuKernel(kernelFn, config, deviceStream, nullptr, "Force Reduction", kernelArgs);
 }

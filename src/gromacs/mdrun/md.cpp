@@ -102,6 +102,7 @@
 #include "gromacs/mdlib/mdatoms.h"
 #include "gromacs/mdlib/mdgraph_gpu.h"
 #include "gromacs/mdlib/mdoutf.h"
+#include "gromacs/mdlib/opc_vsite_support.h"
 #include "gromacs/mdlib/membed.h"
 #include "gromacs/mdlib/resethandler.h"
 #include "gromacs/mdlib/sighandler.h"
@@ -356,6 +357,38 @@ void gmx::LegacySimulator::do_md()
     const bool  useGpuForNonbonded = simulationWork.useGpuNonbonded;
     const bool  useGpuForUpdate    = simulationWork.useGpuUpdate;
 
+    if (simulationWork.useGpuOpcVsites)
+    {
+        const OpcVsiteAnalysis opcVsiteAnalysis = analyzeOpcGpuVsites(topGlobal_);
+        GMX_RELEASE_ASSERT(opcVsiteAnalysis.supported() && opcVsiteAnalysis.hasVirtualSites,
+                           "Invalid OPC CUDA virtual-site workload state");
+        GMX_LOG(mdLog_.info)
+                .asParagraph()
+                .appendTextFormatted("Detected %d supported OPC virtual sites",
+                                     opcVsiteAnalysis.totalVirtualSiteCount);
+        GMX_LOG(mdLog_.info).asParagraph().appendText("OPC virtual-site position construction: CUDA");
+        if (isContiguousOpcVsiteBlock(opcVsiteAnalysis.sites))
+        {
+            GMX_LOG(mdLog_.info)
+                    .asParagraph()
+                    .appendText("OPC virtual-site force spreading: CUDA, fused into GPU force reduction on compatible resident steps");
+        }
+        else
+        {
+            GMX_LOG(mdLog_.info).asParagraph().appendText("OPC virtual-site force spreading: CUDA");
+        }
+        GMX_LOG(mdLog_.info).asParagraph().appendText("GPU-resident update enabled");
+        if (simulationWork.useMdGpuGraph)
+        {
+            GMX_LOG(mdLog_.info)
+                    .asParagraph()
+                    .appendText("OPC virtual-site kernels integrated into CUDA Graphs");
+        }
+        GMX_LOG(mdLog_.info)
+                .asParagraph()
+                .appendText("Virial steps retain the existing CPU force-reduction and virtual-site spread path; regular steps remain GPU-resident.");
+    }
+
     /* Check for polarizable models and flexible constraints */
     gmx_shellfc_t* shellfc = init_shell_flexcon(fpLog_,
                                                 topGlobal_,
@@ -411,6 +444,34 @@ void gmx::LegacySimulator::do_md()
         fr_->longRangeNonbondeds->updateAfterPartition(*md);
     }
 
+    if (simulationWork.useGpuOpcVsites && simulationWork.useGpuBonded)
+    {
+        const int numCmapInteractions =
+                top_->idef.il[InteractionFunction::DihedralEnergyCorrectionMap].size()
+                / (1 + NRAL(InteractionFunction::DihedralEnergyCorrectionMap));
+        if (numCmapInteractions > 0)
+        {
+            GMX_LOG(mdLog_.info)
+                    .asParagraph()
+                    .appendTextFormatted("Detected %d supported CUDA CMAP interactions",
+                                         numCmapInteractions);
+            GMX_LOG(mdLog_.info).asParagraph().appendText("CMAP force/energy/virial: CUDA");
+        }
+        const int numExplicit14Interactions =
+                top_->idef.il[InteractionFunction::LennardJonesCoulomb14Q].size()
+                / (1 + NRAL(InteractionFunction::LennardJonesCoulomb14Q));
+        if (numExplicit14Interactions > 0)
+        {
+            GMX_LOG(mdLog_.info)
+                    .asParagraph()
+                    .appendTextFormatted("Detected %d supported CUDA LJC14_Q interactions",
+                                         numExplicit14Interactions);
+            GMX_LOG(mdLog_.info)
+                    .asParagraph()
+                    .appendText("CHARMM explicit 1-4 pair force/energy/virial: CUDA");
+        }
+    }
+
     // Now that the state is valid we can set up Parrinello-Rahman
     init_parrinellorahman(ir->pressureCouplingOptions,
                           ir->deform,
@@ -450,8 +511,8 @@ void gmx::LegacySimulator::do_md()
                         || ir->pressureCouplingOptions.epc == PressureCoupling::CRescale,
                 "Only Parrinello-Rahman, Berendsen, and C-rescale pressure coupling are supported "
                 "with the GPU update.\n");
-        GMX_RELEASE_ASSERT(!md->haveVsites,
-                           "Virtual sites are not supported with the GPU update.\n");
+        GMX_RELEASE_ASSERT(!md->haveVsites || simulationWork.useGpuOpcVsites,
+                           "Only strictly supported OPC virtual sites are supported with GPU update.\n");
         GMX_RELEASE_ASSERT(ed == nullptr,
                            "Essential dynamics is not supported with the GPU update.\n");
         GMX_RELEASE_ASSERT(!ir->bPull || !pull_have_constraint(*ir->pull),
@@ -968,7 +1029,7 @@ void gmx::LegacySimulator::do_md()
                 && (do_per_step(step, ir->nstvout) || checkpointHandler->isCheckpointingStep()
                     || do_per_step(step, c_virtualSiteVelocityUpdateInterval));
 
-        if (virtualSites_ != nullptr)
+        if (virtualSites_ != nullptr && (!simulationWork.useGpuOpcVsites || bNS))
         {
             // Virtual sites need to be updated before domain decomposition and forces are calculated
             wallcycle_start(wallCycleCounters_, WallCycleCounter::VsiteConstr);
@@ -1142,7 +1203,6 @@ void gmx::LegacySimulator::do_md()
 
         runScheduleWork_->stepWork = setupStepWorkload(
                 legacyForceFlags, ir->mtsLevels, step, runScheduleWork_->domainWork, simulationWork);
-
         const bool doTemperatureScaling = (ir->etc != TemperatureCoupling::No
                                            && do_per_step(step + ir->nsttcouple - 1, ir->nsttcouple));
 
@@ -1192,6 +1252,11 @@ void gmx::LegacySimulator::do_md()
             || !mdGraph->useGraphThisStep())
         {
 
+            VirtualSitesHandler* vsiteForForce =
+                    (simulationWork.useGpuOpcVsites && runScheduleWork_->stepWork.useGpuFBufferOps)
+                            ? nullptr
+                            : virtualSites_;
+
             if (shellfc)
             {
                 /* Now is the time to relax the shells */
@@ -1225,7 +1290,7 @@ void gmx::LegacySimulator::do_md()
                                     *runScheduleWork_,
                                     t,
                                     mu_tot,
-                                    virtualSites_,
+                                    vsiteForForce,
                                     ddBalanceRegionHandler);
             }
             else
@@ -1271,7 +1336,7 @@ void gmx::LegacySimulator::do_md()
                          state_->lambda,
                          fr_,
                          *runScheduleWork_,
-                         virtualSites_,
+                         vsiteForForce,
                          mu_tot,
                          t,
                          ed ? ed->getLegacyED() : nullptr,
@@ -1389,8 +1454,9 @@ void gmx::LegacySimulator::do_md()
             //       copy call in do_force(...).
             // NOTE: The forces should not be copied here if the vsites are present, since they were modified
             //       on host after the D2H copy in do_force(...).
-            if (runScheduleWork_->stepWork.useGpuFBufferOps
-                && (simulationWork.useGpuUpdate && !virtualSites_) && do_per_step(step, ir->nstfout))
+            if (runScheduleWork_->stepWork.useGpuFBufferOps && simulationWork.useGpuUpdate
+                && (!virtualSites_ || simulationWork.useGpuOpcVsites)
+                && do_per_step(step, ir->nstfout))
             {
                 stateGpu->copyForcesFromGpu(f.view().force(), AtomLocality::Local);
                 stateGpu->waitForcesReadyOnHost(AtomLocality::Local);

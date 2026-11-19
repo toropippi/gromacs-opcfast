@@ -218,6 +218,7 @@ private:
 
     //! Vector with diagonal elements of the Parrinello-Rahman pressure coupling velocity rescale factors
     Float3 prVelocityScalingMatrixDiagonal_;
+
 };
 
 } // namespace gmx

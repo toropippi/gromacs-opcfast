@@ -40,6 +40,9 @@
 
 #include "config.h"
 
+#include <array>
+#include <vector>
+
 #include <gtest/gtest.h>
 
 #if GMX_HAVE_GPU_GRAPH_SUPPORT
@@ -50,6 +53,10 @@
 #    include "gromacs/gpu_utils/gpueventsynchronizer.h"
 #    include "gromacs/gpu_utils/hostallocator.h"
 #    include "gromacs/mdlib/mdgraph_gpu.h"
+#    include "gromacs/mdlib/opc_vsite_gpu.h"
+#    include "gromacs/mdlib/opc_vsite_support.h"
+#    include "gromacs/pbcutil/pbc_aiuc.h"
+#    include "gromacs/utility/vectypes.h"
 
 #    include "testutils/refdata.h"
 #    include "testutils/test_hardware_environment.h"
@@ -208,6 +215,161 @@ TEST(MdGraphTest, MdGpuGraphExecutesActivities)
                 EXPECT_EQ(h_output[0], 0);
             }
         }
+    }
+}
+
+TEST(MdGraphTest, OpcVsiteKernelsCaptureAndReplay)
+{
+    const auto& testDeviceList = getTestHardwareEnvironment()->getTestDeviceList();
+    if (testDeviceList.empty())
+    {
+        GTEST_SKIP() << "No compatible GPUs to test on.";
+    }
+
+    constexpr float weightH = 0.1477224F;
+    const std::vector<OpcVsiteGpuData> sites = { { 0, 1, 2, 3, weightH, weightH } };
+    const std::array<Float3, 4> initialCoordinates = {
+        Float3{ 1.0F, 1.0F, 1.0F },
+        Float3{ 1.1F, 1.0F, 1.0F },
+        Float3{ 1.0F, 1.1F, 1.0F },
+        Float3{ 1.0F, 1.0F, 1.0F }
+    };
+    const std::array<Float3, 4> initialVelocities = {
+        Float3{ 1.0F, 2.0F, 3.0F },
+        Float3{ 2.0F, 3.0F, 4.0F },
+        Float3{ 3.0F, 4.0F, 5.0F },
+        Float3{ 0.0F, 0.0F, 0.0F }
+    };
+    const std::array<Float3, 4> initialForces = {
+        Float3{ 1.0F, 2.0F, 3.0F },
+        Float3{ 4.0F, 5.0F, 6.0F },
+        Float3{ 7.0F, 8.0F, 9.0F },
+        Float3{ 10.0F, 20.0F, 30.0F }
+    };
+
+    for (const auto& testDevice : testDeviceList)
+    {
+#    if GMX_GPU_SYCL
+        if (!testDevice->deviceInfo().supportsSyclGraph)
+        {
+            GTEST_SKIP() << "Device does not support GPU Graphs";
+        }
+#    endif
+        const DeviceContext& deviceContext = testDevice->deviceContext();
+        deviceContext.activate();
+        SimulationWorkload  simulationWork = makeSimulationWorkForMdGpuGraph();
+        DeviceStreamManager deviceStreamManager(testDevice->deviceInfo(), simulationWork, false);
+        const DeviceStream&  localStream =
+                deviceStreamManager.stream(DeviceStreamType::NonBondedLocal);
+        const DeviceStream& updateStream =
+                deviceStreamManager.stream(DeviceStreamType::UpdateAndConstraints);
+
+        DeviceBuffer<Float3> d_coordinates;
+        DeviceBuffer<Float3> d_velocities;
+        DeviceBuffer<Float3> d_forces;
+        allocateDeviceBuffer(&d_coordinates, initialCoordinates.size(), deviceContext);
+        allocateDeviceBuffer(&d_velocities, initialVelocities.size(), deviceContext);
+        allocateDeviceBuffer(&d_forces, initialForces.size(), deviceContext);
+        copyToDeviceBuffer(&d_coordinates,
+                           initialCoordinates.data(),
+                           0,
+                           initialCoordinates.size(),
+                           updateStream,
+                           GpuApiCallBehavior::Sync,
+                           nullptr);
+        copyToDeviceBuffer(&d_velocities,
+                           initialVelocities.data(),
+                           0,
+                           initialVelocities.size(),
+                           updateStream,
+                           GpuApiCallBehavior::Sync,
+                           nullptr);
+        copyToDeviceBuffer(&d_forces,
+                           initialForces.data(),
+                           0,
+                           initialForces.size(),
+                           localStream,
+                           GpuApiCallBehavior::Sync,
+                           nullptr);
+
+        OpcVsiteGpu positionVsites(sites, deviceContext, updateStream);
+        OpcVsiteGpu forceVsites(sites, deviceContext, localStream);
+        GpuEventSynchronizer xReadyOnDeviceEvent;
+        GpuEventSynchronizer xUpdatedOnDeviceEvent;
+        MdGpuGraph mdGpuGraph(deviceStreamManager,
+                              simulationWork,
+                              MPI_COMM_WORLD,
+                              MdGraphEvenOrOddStep::EvenStep,
+                              nullptr);
+        MdGpuGraph mdGpuGraphAlternate(deviceStreamManager,
+                                       simulationWork,
+                                       MPI_COMM_WORLD,
+                                       MdGraphEvenOrOddStep::OddStep,
+                                       nullptr);
+        mdGpuGraph.setAlternateStepPpTaskCompletionEvent(
+                mdGpuGraphAlternate.getPpTaskCompletionEvent());
+
+        xReadyOnDeviceEvent.markEvent(localStream);
+        ASSERT_TRUE(mdGpuGraph.captureThisStep(true));
+        mdGpuGraph.setUsedGraphLastStep(false);
+        mdGpuGraph.startRecord(&xReadyOnDeviceEvent);
+
+        matrix box = { { 10.0_real, 0, 0 }, { 0, 10.0_real, 0 }, { 0, 0, 10.0_real } };
+        PbcAiuc pbcAiuc;
+        setPbcAiuc(3, box, &pbcAiuc);
+        forceVsites.spreadForces(d_forces);
+        positionVsites.constructPositions(d_coordinates, pbcAiuc);
+        positionVsites.constructVelocities(d_velocities);
+
+        mdGpuGraph.endRecord();
+        mdGpuGraph.createExecutableGraph(true);
+        mdGpuGraph.launchGraphMdStep(&xUpdatedOnDeviceEvent);
+        xUpdatedOnDeviceEvent.waitForEvent();
+
+        std::array<Float3, 4> coordinates;
+        std::array<Float3, 4> velocities;
+        std::array<Float3, 4> forces;
+        copyFromDeviceBuffer(coordinates.data(),
+                             &d_coordinates,
+                             0,
+                             coordinates.size(),
+                             updateStream,
+                             GpuApiCallBehavior::Sync,
+                             nullptr);
+        copyFromDeviceBuffer(velocities.data(),
+                             &d_velocities,
+                             0,
+                             velocities.size(),
+                             updateStream,
+                             GpuApiCallBehavior::Sync,
+                             nullptr);
+        copyFromDeviceBuffer(forces.data(),
+                             &d_forces,
+                             0,
+                             forces.size(),
+                             localStream,
+                             GpuApiCallBehavior::Sync,
+                             nullptr);
+
+        EXPECT_NEAR(coordinates[3][XX], 1.0F + 0.1F * weightH, 2.0e-6F);
+        EXPECT_NEAR(coordinates[3][YY], 1.0F + 0.1F * weightH, 2.0e-6F);
+        EXPECT_NEAR(coordinates[3][ZZ], 1.0F, 2.0e-6F);
+        const float weightO = 1.0F - 2.0F * weightH;
+        for (int d = 0; d < DIM; ++d)
+        {
+            const float expectedVelocity = weightO * initialVelocities[0][d]
+                                           + weightH * initialVelocities[1][d]
+                                           + weightH * initialVelocities[2][d];
+            EXPECT_NEAR(velocities[3][d], expectedVelocity, 2.0e-6F);
+            EXPECT_NEAR(forces[0][d], initialForces[0][d] + weightO * initialForces[3][d], 2.0e-6F);
+            EXPECT_NEAR(forces[1][d], initialForces[1][d] + weightH * initialForces[3][d], 2.0e-6F);
+            EXPECT_NEAR(forces[2][d], initialForces[2][d] + weightH * initialForces[3][d], 2.0e-6F);
+            EXPECT_FLOAT_EQ(forces[3][d], 0.0F);
+        }
+
+        freeDeviceBuffer(&d_coordinates);
+        freeDeviceBuffer(&d_velocities);
+        freeDeviceBuffer(&d_forces);
     }
 }
 

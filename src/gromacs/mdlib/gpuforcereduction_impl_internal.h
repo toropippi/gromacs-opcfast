@@ -48,6 +48,17 @@ class DeviceStream;
 namespace gmx
 {
 
+//! Compact OPC block description for CUDA force-spread fusion.
+struct OpcVsiteForceReductionFusion
+{
+    int   atomStart = -1;
+    int   numSites  = 0;
+    float weightH1  = 0;
+    float weightH2  = 0;
+
+    bool enabled() const { return atomStart >= 0 && numSites > 0; }
+};
+
 /*! \brief Backend-specific function to launch GPU Force Reduction kernel.
  *
  * In pseudocode:
@@ -74,6 +85,7 @@ namespace gmx
  * \param deviceStream Device stream for kernel submission.
  * \param d_forcesReadyNvshmemFlags  NVSHMEM signals from PME to PP force transfer.
  * \param forcesReadyNvshmemFlagsCounter Tracks NVSHMEM signal from PME to PP force transfer.
+ * \param opcVsiteFusion Optional contiguous OPC block to spread in the CUDA reduction kernel.
  */
 void launchForceReductionKernel(int                        numAtoms,
                                 int                        atomStart,
@@ -85,6 +97,7 @@ void launchForceReductionKernel(int                        numAtoms,
                                 DeviceBuffer<int>          d_cell,
                                 const DeviceStream&        deviceStream,
                                 DeviceBuffer<uint64_t>     d_forcesReadyNvshmemFlags,
-                                const uint64_t             forcesReadyNvshmemFlagsCounter);
+                                const uint64_t             forcesReadyNvshmemFlagsCounter,
+                                OpcVsiteForceReductionFusion opcVsiteFusion = {});
 
 } // namespace gmx

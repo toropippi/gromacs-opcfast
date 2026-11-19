@@ -52,6 +52,8 @@
 namespace gmx
 {
 
+class OpcVsiteGpu;
+
 //! \internal
 //! \brief structure to hold cell information for any nbat-format forces
 struct cellInfo
@@ -76,7 +78,10 @@ public:
      * \param [in] deviceContext GPU device context
      * \param [in] wcycle        The wallclock counter
      */
-    Impl(const DeviceContext& deviceContext, const DeviceStream& deviceStream, gmx_wallcycle* wcycle);
+    Impl(const DeviceContext&                  deviceContext,
+         const DeviceStream&                   deviceStream,
+         gmx_wallcycle*                        wcycle,
+         const std::vector<OpcVsiteGpuData>&   opcVsites);
 
     ~Impl();
     /*! \brief Register a nbnxm-format force to be reduced
@@ -151,6 +156,15 @@ private:
 
     //! event to be marked when reduction launch has been completed
     GpuEventSynchronizer* completionMarker_ = nullptr;
+    //! Optional CUDA OPC force spread, enqueued after reduction and before completionMarker_.
+    std::unique_ptr<OpcVsiteGpu> opcVsites_;
+    //! Start of a strictly contiguous O/H1/H2/EPW block, or -1 when unavailable.
+    int opcBlockAtomStart_ = -1;
+    //! Number of sites in the contiguous block.
+    int opcBlockNumSites_ = 0;
+    //! Common OPC weights for the contiguous block.
+    float opcBlockWeightH1_ = 0;
+    float opcBlockWeightH2_ = 0;
     //! The wallclock counter
     gmx_wallcycle* wcycle_ = nullptr;
 };

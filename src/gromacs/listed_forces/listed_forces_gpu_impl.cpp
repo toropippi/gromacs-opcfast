@@ -156,7 +156,8 @@ class ListedForcesGpu::Impl
 };
 
 ListedForcesGpu::ListedForcesGpu(const gmx_ffparams_t& /* ffparams */,
-                                 const float /* electrostaticsScaleFactor */,
+                                 const float /* coulombConstant */,
+                                 const float /* fudgeQQ */,
                                  const int /* numEnergyGroupsForListedForces */,
                                  const DeviceContext& /* deviceContext */,
                                  const DeviceStream& /* deviceStream */,

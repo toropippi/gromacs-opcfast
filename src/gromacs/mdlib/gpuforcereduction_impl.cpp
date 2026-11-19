@@ -49,6 +49,7 @@
 #include "gromacs/gpu_utils/gpueventsynchronizer.h"
 #include "gromacs/gpu_utils/gputraits.h"
 #include "gromacs/mdlib/gpuforcereduction_impl_internal.h"
+#include "gromacs/mdlib/opc_vsite_gpu.h"
 #include "gromacs/utility/gmxassert.h"
 
 namespace gmx
@@ -56,7 +57,8 @@ namespace gmx
 
 GpuForceReduction::Impl::Impl(const DeviceContext& deviceContext,
                               const DeviceStream&  deviceStream,
-                              gmx_wallcycle*       wcycle) :
+                              gmx_wallcycle*       wcycle,
+                              const std::vector<OpcVsiteGpuData>& opcVsites) :
     baseForce_(),
     deviceContext_(deviceContext),
     deviceStream_(deviceStream),
@@ -64,9 +66,24 @@ GpuForceReduction::Impl::Impl(const DeviceContext& deviceContext,
     rvecForceToAdd_(),
     forcesReadyNvshmemFlags(nullptr),
     forcesReadyNvshmemFlagsCounter(0),
+    opcVsites_(opcVsites.empty()
+                       ? nullptr
+                       : std::make_unique<OpcVsiteGpu>(opcVsites, deviceContext, deviceStream)),
     wcycle_(wcycle)
 {
     cellInfo_.d_cell = nullptr;
+
+    if (!opcVsites.empty())
+    {
+        const OpcVsiteGpuData& first = opcVsites.front();
+        if (isContiguousOpcVsiteBlock(opcVsites))
+        {
+            opcBlockAtomStart_ = first.oxygen;
+            opcBlockNumSites_  = static_cast<int>(opcVsites.size());
+            opcBlockWeightH1_  = first.weightH1;
+            opcBlockWeightH2_  = first.weightH2;
+        }
+    }
 }
 
 void GpuForceReduction::Impl::reinit(DeviceBuffer<Float3>  baseForcePtr,
@@ -145,6 +162,19 @@ void GpuForceReduction::Impl::execute()
             synchronizer->enqueueWaitEvent(deviceStream_);
         }
 
+        OpcVsiteForceReductionFusion opcVsiteFusion;
+#if GMX_GPU_CUDA
+        // The CUDA fused kernel does not read a destination force that another
+        // thread can be writing. Fall back to the standalone spread whenever
+        // force reduction accumulates into an existing buffer.
+        if (!accumulate_ && atomStart_ == 0 && opcBlockAtomStart_ >= 0
+            && opcBlockAtomStart_ + 4 * opcBlockNumSites_ <= numAtoms_)
+        {
+            opcVsiteFusion =
+                    { opcBlockAtomStart_, opcBlockNumSites_, opcBlockWeightH1_, opcBlockWeightH2_ };
+        }
+#endif
+
         launchForceReductionKernel(numAtoms_,
                                    atomStart_,
                                    addRvecForce,
@@ -155,7 +185,12 @@ void GpuForceReduction::Impl::execute()
                                    cellInfo_.d_cell,
                                    deviceStream_,
                                    forcesReadyNvshmemFlags,
-                                   forcesReadyNvshmemFlagsCounter);
+                                   forcesReadyNvshmemFlagsCounter,
+                                   opcVsiteFusion);
+        if (opcVsites_ && !opcVsiteFusion.enabled())
+        {
+            opcVsites_->spreadForces(baseForce_);
+        }
     }
     else
     {
@@ -195,8 +230,9 @@ GpuForceReduction::Impl::~Impl()
 
 GpuForceReduction::GpuForceReduction(const DeviceContext& deviceContext,
                                      const DeviceStream&  deviceStream,
-                                     gmx_wallcycle*       wcycle) :
-    impl_(new Impl(deviceContext, deviceStream, wcycle))
+                                     gmx_wallcycle*       wcycle,
+                                     const std::vector<OpcVsiteGpuData>& opcVsites) :
+    impl_(new Impl(deviceContext, deviceStream, wcycle, opcVsites))
 {
 }
 

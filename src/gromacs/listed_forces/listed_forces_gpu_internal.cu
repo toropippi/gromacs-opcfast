@@ -198,6 +198,20 @@ __global__ void bonded_kernel_gpu(BondedGpuKernelParameters kernelParams,
                                                  kernelParams.pbcAiuc,
                                                  threadIdx.x);
                     break;
+                case InteractionFunction::DihedralEnergyCorrectionMap:
+                    cmap_gpu<calcVir, calcEner>(fTypeTid,
+                                                &vtot_loc,
+                                                iatoms,
+                                                kernelBuffers.d_forceParams,
+                                                kernelBuffers.d_cmapCoefficients,
+                                                kernelParams.cmapGridSpacing,
+                                                kernelParams.cmapCoefficientsPerMap,
+                                                gm_xq,
+                                                gm_f,
+                                                sm_fShiftLoc,
+                                                kernelParams.pbcAiuc,
+                                                threadIdx.x);
+                    break;
                 case InteractionFunction::LennardJones14:
                     pairs_gpu<calcVir, calcEner>(fTypeTid,
                                                  iatoms,
@@ -206,10 +220,25 @@ __global__ void bonded_kernel_gpu(BondedGpuKernelParameters kernelParams,
                                                  gm_f,
                                                  sm_fShiftLoc,
                                                  kernelParams.pbcAiuc,
-                                                 kernelParams.electrostaticsScaleFactor,
+                                                 kernelParams.coulombConstant,
+                                                 kernelParams.fudgeQQ,
                                                  &vtot_loc,
                                                  &vtotElec_loc,
                                                  threadIdx.x);
+                    break;
+                case InteractionFunction::LennardJonesCoulomb14Q:
+                    pairs_gpu<calcVir, calcEner, true>(fTypeTid,
+                                                       iatoms,
+                                                       kernelBuffers.d_forceParams,
+                                                       gm_xq,
+                                                       gm_f,
+                                                       sm_fShiftLoc,
+                                                       kernelParams.pbcAiuc,
+                                                       kernelParams.coulombConstant,
+                                                       kernelParams.fudgeQQ,
+                                                       &vtot_loc,
+                                                       &vtotElec_loc,
+                                                       threadIdx.x);
                     break;
                 default:
                     // these types do not appear on the GPU
@@ -242,7 +271,9 @@ __global__ void bonded_kernel_gpu(BondedGpuKernelParameters kernelParams,
         {
             atomicAdd(vtot, vtot_loc);
         }
-        else if ((threadIdx.x % warpSize == 1) && (fType == InteractionFunction::LennardJones14))
+        else if ((threadIdx.x % warpSize == 1)
+                 && (fType == InteractionFunction::LennardJones14
+                     || fType == InteractionFunction::LennardJonesCoulomb14Q))
         {
             atomicAdd(vtotElec, vtot_loc);
         }

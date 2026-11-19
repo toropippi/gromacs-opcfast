@@ -125,10 +125,12 @@ void launchForceReductionKernel(int                    numAtoms,
                                 DeviceBuffer<int>      d_cell,
                                 const DeviceStream&    deviceStream,
                                 DeviceBuffer<uint64_t> d_forcesReadyNvshmemFlags,
-                                const uint64_t         forcesReadyNvshmemFlagsCounter)
+                                const uint64_t         forcesReadyNvshmemFlagsCounter,
+                                const OpcVsiteForceReductionFusion opcVsiteFusion)
 {
     GMX_UNUSED_VALUE(d_forcesReadyNvshmemFlags);
     GMX_UNUSED_VALUE(forcesReadyNvshmemFlagsCounter);
+    GMX_UNUSED_VALUE(opcVsiteFusion);
     dispatchTemplatedFunction(
             [&](auto addRvecForce_, auto accumulateForce_)
             {

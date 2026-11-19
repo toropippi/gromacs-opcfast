@@ -62,6 +62,8 @@ class GpuEventSynchronizer;
 namespace gmx
 {
 
+class OpcVsiteGpu;
+
 /*! \internal \brief Class with interfaces and data for GPU version of Update-Constraint. */
 class UpdateConstrainGpu::Impl
 {
@@ -216,6 +218,8 @@ private:
     std::unique_ptr<LincsGpu> lincsGpu_;
     //! SETTLE GPU object for water constrains
     std::unique_ptr<SettleGpu> settleGpu_;
+    //! Strict OPC virtual-site construction after constraints, when enabled.
+    std::unique_ptr<OpcVsiteGpu> opcVsites_;
 
     //! The event to indicate when the update of coordinates is complete
     GpuEventSynchronizer xUpdatedOnDeviceEvent_;

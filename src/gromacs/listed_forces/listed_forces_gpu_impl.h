@@ -89,8 +89,18 @@ struct BondedGpuKernelParameters
 {
     //! Periodic boundary data
     PbcAiuc pbcAiuc;
-    //! Scale factor
+    //! Coulomb conversion factor.
+    float coulombConstant;
+    //! Global 1-4 electrostatic scaling factor.
+    float fudgeQQ;
+    //! Combined scale retained for the non-CUDA backend implementations.
     float electrostaticsScaleFactor;
+#if GMX_GPU_CUDA
+    //! Number of points along each dimension of a CMAP grid.
+    int cmapGridSpacing = 0;
+    //! Number of precomputed bicubic coefficients per CMAP parameter map.
+    int cmapCoefficientsPerMap = 0;
+#endif
     //! The bonded types on GPU
     InteractionFunction fTypesOnGpu[numFTypesOnGpu];
     //! The number of bonds for every function type
@@ -103,6 +113,8 @@ struct BondedGpuKernelParameters
     {
         matrix boxDummy = { { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 0 } };
         setPbcAiuc(0, boxDummy, &pbcAiuc);
+        coulombConstant               = 1.0F;
+        fudgeQQ                       = 1.0F;
         electrostaticsScaleFactor = 1.0F;
     }
 };
@@ -112,6 +124,10 @@ struct BondedGpuKernelBuffers
     DeviceBuffer<t_iparams> d_forceParams = nullptr;
     //! Total Energy (on GPU)
     DeviceBuffer<float> d_vTot = nullptr;
+#if GMX_GPU_CUDA
+    //! Precomputed bicubic CMAP coefficients, 16 values per grid cell.
+    DeviceBuffer<float> d_cmapCoefficients = nullptr;
+#endif
     //! Interaction list atoms (on GPU)
     DeviceBuffer<t_iatom> d_iatoms[numFTypesOnGpu];
 };
@@ -122,7 +138,8 @@ class ListedForcesGpu::Impl
 public:
     //! Constructor
     Impl(const gmx_ffparams_t& ffparams,
-         float                 electrostaticsScaleFactor,
+         float                 coulombConstant,
+         float                 fudgeQQ,
          int                   numEnergyGroupsForListedForces,
          const DeviceContext&  deviceContext,
          const DeviceStream&   deviceStream,
@@ -186,6 +203,10 @@ private:
     gmx::EnumerationArray<InteractionFunction, int>                   d_iAtomsAlloc_ = {};
     //! Bonded parameters for device-side use.
     DeviceBuffer<t_iparams> d_forceParams_ = nullptr;
+#if GMX_GPU_CUDA
+    //! Precomputed bicubic CMAP coefficients for all parameter maps.
+    DeviceBuffer<float> d_cmapCoefficients_ = nullptr;
+#endif
     //! Position-charge vector on the device.
     DeviceBuffer<Float4> d_xq_ = nullptr;
     //! Force vector on the device.

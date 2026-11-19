@@ -61,6 +61,7 @@
 #include "gromacs/listed_forces/listed_forces_gpu.h"
 #include "gromacs/mdlib/constr.h"
 #include "gromacs/mdlib/gmx_omp_nthreads.h"
+#include "gromacs/mdlib/opc_vsite_support.h"
 #include "gromacs/mdlib/update_constrain_gpu.h"
 #include "gromacs/mdtypes/commrec.h"
 #include "gromacs/mdtypes/inputrec.h"
@@ -822,8 +823,24 @@ bool decideWhetherToUseGpuForUpdate(const bool           isDomainDecomposition,
     errorReasons.appendIf((usingPmeOrEwald(inputrec.coulombtype) && inputrec.epsilon_surface != 0),
                           // The graph is needed, but not supported
                           "Ewald surface correction is not supported.");
-    errorReasons.appendIf((gmx_mtop_interaction_count(mtop, IF_VSITE) > 0),
-                          "Virtual sites are not supported.");
+    const bool haveVirtualSites = gmx_mtop_interaction_count(mtop, IF_VSITE) > 0;
+    if (haveVirtualSites)
+    {
+        const OpcVsiteAnalysis opcVsites = analyzeOpcGpuVsites(mtop);
+        errorReasons.appendIf(!GMX_GPU_CUDA,
+                              "OPC virtual sites with GPU update are supported only by CUDA.");
+        errorReasons.appendIf(!opcVsites.supported(),
+                              formatString("Virtual sites are not supported by the CUDA OPC MVP: %s",
+                                           opcVsites.rejectionReason.c_str()));
+        errorReasons.appendIf(isDomainDecomposition,
+                              "CUDA OPC virtual sites require a single PP rank without domain decomposition.");
+        errorReasons.appendIf(havePmeOnlyRank,
+                              "CUDA OPC virtual sites do not support separate PME ranks.");
+        errorReasons.appendIf(inputrec.efep != FreeEnergyPerturbationType::No,
+                              "CUDA OPC virtual sites do not support free-energy perturbation.");
+        errorReasons.appendIf(inputrec.bPull,
+                              "CUDA OPC virtual sites do not support pulling.");
+    }
     errorReasons.appendIf(useEssentialDynamics, "Essential dynamics is not supported.");
     errorReasons.appendIf((inputrec.bPull && pull_have_constraint(*inputrec.pull)),
                           "Constraints pulling is not supported.");

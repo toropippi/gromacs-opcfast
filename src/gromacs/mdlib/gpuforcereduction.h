@@ -45,8 +45,10 @@
 #include "config.h"
 
 #include <memory>
+#include <vector>
 
 #include "gromacs/gpu_utils/devicebuffer_datatype.h"
+#include "gromacs/mdlib/opc_vsite_support.h"
 #include "gromacs/timing/wallcycle.h"
 #include "gromacs/utility/arrayref.h"
 #include "gromacs/utility/fixedcapacityvector.h"
@@ -77,10 +79,12 @@ public:
      * \param [in] deviceContext GPU device context
      * \param [in] deviceStream  Stream to use for reduction
      * \param [in] wcycle        Wall-clock cycle counter
+     * \param [in] opcVsites     Strictly validated OPC virtual sites to spread after reduction
      */
     GpuForceReduction(const DeviceContext& deviceContext,
                       const DeviceStream&  deviceStream,
-                      gmx_wallcycle*       wcycle);
+                      gmx_wallcycle*       wcycle,
+                      const std::vector<OpcVsiteGpuData>& opcVsites = {});
     ~GpuForceReduction();
 
     /*! \brief Register a nbnxm-format force to be reduced

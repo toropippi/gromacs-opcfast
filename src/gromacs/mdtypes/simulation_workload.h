@@ -191,6 +191,8 @@ public:
     bool useGpuBonded = false;
     //! If update and constraint solving is performed on GPU.
     bool useGpuUpdate = false;
+    //! If strictly supported OPC virtual sites are constructed and spread on CUDA.
+    bool useGpuOpcVsites = false;
     //! If X buffer operations are allowed on GPU (actual use depends on other activities that step).
     bool useGpuXBufferOpsWhenAllowed = false;
     //! If F buffer operations are allowed on GPU (actual use depends on other activities that step).
